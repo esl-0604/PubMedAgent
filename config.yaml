@@ -1,0 +1,92 @@
+# PubMed 검색 설정
+# 쿼리 구조: (keywords OR ...) AND (domain_terms OR ...) [AND authors]
+keywords:
+  # A. 핵심
+  - "robotic endoscopy"
+  - "endoscopic robot"
+  - "endoluminal robot"
+  - "flexible endoscopic surgery"
+  - "endoscopic submucosal dissection"
+  - "endoscopic suturing"
+  - "endoscopic traction"
+  - "endoscopic full-thickness resection"
+  # B. 인접 기술
+  - "natural orifice transluminal endoscopic surgery"
+  - "single-port robotic surgery"
+  - "per-oral endoscopic myotomy"
+  - "third space endoscopy"
+  - "transanal endoscopic"
+  # C. 보조/지능화
+  - "computer-aided detection"
+  - "polyp detection"
+  - "haptic feedback"
+  - "surgical teleoperation"
+
+# GI(위장관) 도메인으로 결과를 국한 (쿼리 A의 AND 조건).
+domain_terms:
+  - "gastrointestinal"
+  - "gastric"
+  - "stomach"
+  - "esophageal"
+  - "esophagus"
+  - "colorectal"
+  - "colonic"
+  - "colon"
+  - "rectal"
+  - "duodenal"
+  - "small bowel"
+  - "intestinal"
+
+# 쿼리 A에 적용하는 GI/내시경 주요 저널 (NLM ISO 약어).
+journals:
+  - "Gastrointest Endosc"
+  - "Endoscopy"
+  - "Gut"
+  - "Gastroenterology"
+  - "Surg Endosc"
+  - "Dig Endosc"
+  - "Clin Gastroenterol Hepatol"
+  - "Am J Gastroenterol"
+  - "Endosc Int Open"
+  - "Tech Innov Gastrointest Endosc"
+  - "J Gastroenterol Hepatol"
+  - "Gastric Cancer"
+
+# 쿼리 B: Medical Physical AI — GI 국한을 벗어나도 포함.
+physical_ai_terms:
+  - "surgical robot"
+  - "medical robot"
+  - "autonomous surgery"
+  - "surgical autonomy"
+  - "robot-assisted surgery"
+  - "imitation learning"
+  - "reinforcement learning"
+  - "vision-language-action"
+  - "embodied AI"
+  - "surgical foundation model"
+  - "robot learning"
+  - "teleoperation"
+
+physical_ai_journals:
+  - "Sci Robot"
+  - "IEEE Trans Med Robot Bionics"
+  - "Int J Med Robot"
+  - "IEEE Trans Biomed Eng"
+  - "Nat Biomed Eng"
+  - "NPJ Digit Med"
+  - "Med Image Anal"
+  - "Nat Med"
+  - "Ann Surg"
+
+authors: []
+
+lookback_days: 2
+max_results: 10
+
+# Slack
+slack_channel_id: "C0AT6K46UC9"
+
+# Claude 요약 설정
+# 저렴/빠름: "claude-haiku-4-5". 품질 최고: "claude-sonnet-4-6" 또는 "claude-opus-4-6"
+anthropic_model: "claude-haiku-4-5"
+summary_language: "Korean"
