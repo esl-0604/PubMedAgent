@@ -109,6 +109,7 @@ def format_logic_summary_blocks(cfg: dict) -> tuple[str, list[dict]]:
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": header_text}},
         {"type": "section", "text": {"type": "mrkdwn", "text": body}},
+        {"type": "divider"},
     ]
     return header_text, blocks
 
@@ -338,8 +339,8 @@ def format_article_blocks(index: int, total: int, article: dict, summary_kr: str
         f"*[핵심 요약]*\n{summary_kr}"
     )
     return [
-        {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text": body}},
+        {"type": "divider"},
     ]
 
 
@@ -425,6 +426,7 @@ def main() -> int:
         {"type": "header", "text": {"type": "plain_text", "text": parent_text}},
         {"type": "context",
          "elements": [{"type": "mrkdwn", "text": "쓰레드에서 상세 확인"}]},
+        {"type": "divider"},
     ]
     parent = slack_post(slack_token, channel, parent_text, parent_blocks)
     thread_ts = parent["ts"]

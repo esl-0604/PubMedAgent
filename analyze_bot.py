@@ -272,6 +272,7 @@ def post_to_channel(article: dict, analysis: str, requester_id: str,
         {"type": "section",
          "text": {"type": "mrkdwn",
                   "text": f"*{header}*\n_{byline}_\n요청자: <@{requester_id}>"}},
+        {"type": "divider"},
     ]
     parent = web_client.chat_postMessage(
         channel=CHANNEL, text=parent_text, blocks=parent_blocks,
@@ -279,14 +280,19 @@ def post_to_channel(article: dict, analysis: str, requester_id: str,
     )
     thread_ts = parent["ts"]
 
-    # Slack section 블록 텍스트 한계(3000자) 방어: 필요시 분할
-    for chunk in _chunk(analysis, 2800):
+    # Slack section 블록 텍스트 한계(3000자) 방어: 필요시 분할.
+    # 마지막 청크에만 divider 붙여서 다음 메시지와 시각 분리.
+    chunks = _chunk(analysis, 2800)
+    for i, chunk in enumerate(chunks):
+        blocks = [{"type": "section",
+                   "text": {"type": "mrkdwn", "text": chunk}}]
+        if i == len(chunks) - 1:
+            blocks.append({"type": "divider"})
         web_client.chat_postMessage(
             channel=CHANNEL,
             thread_ts=thread_ts,
             text="상세 분석",
-            blocks=[{"type": "section",
-                     "text": {"type": "mrkdwn", "text": chunk}}],
+            blocks=blocks,
             unfurl_links=False, unfurl_media=False,
         )
 
