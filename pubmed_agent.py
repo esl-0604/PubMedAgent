@@ -21,8 +21,6 @@ import requests
 import yaml
 from anthropic import Anthropic
 
-from usage_logger import log_usage
-
 ROOT = Path(__file__).parent
 CONFIG_PATH = ROOT / "config.yaml"
 STATE_PATH = ROOT / "state" / "sent_pmids.json"
@@ -287,7 +285,6 @@ def summarize_korean(client: Anthropic, model: str, article: dict) -> str:
         system=system,
         messages=[{"role": "user", "content": user}],
     )
-    log_usage("pubmed_agent", model, resp.usage, "summary")
     return resp.content[0].text.strip()
 
 

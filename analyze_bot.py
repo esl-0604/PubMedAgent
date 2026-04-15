@@ -36,7 +36,6 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from anthropic import Anthropic
 
 from pubmed_agent import EUTILS, efetch, load_config, load_dotenv
-from usage_logger import log_usage
 
 load_dotenv()
 CFG = load_config()
@@ -186,7 +185,6 @@ def extract_metadata_from_text(text: str) -> dict:
         system=system,
         messages=[{"role": "user", "content": snippet}],
     )
-    log_usage("analyze_bot", MODEL, resp.usage, "pdf_meta")
     raw = resp.content[0].text.strip()
     # 혹시 ```json ... ``` 포장되어 오면 벗기기
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL)
@@ -232,7 +230,6 @@ def analyze_article(article: dict) -> str:
         system=system,
         messages=[{"role": "user", "content": user}],
     )
-    log_usage("analyze_bot", MODEL, resp.usage, "analysis")
     return resp.content[0].text.strip()
 
 
