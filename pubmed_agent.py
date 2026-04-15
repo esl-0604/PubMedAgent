@@ -320,8 +320,14 @@ def format_article_blocks(index: int, total: int, article: dict, summary_kr: str
         first_author += " et al."
     affiliation = article.get("affiliation") or "기관 정보 없음"
     byline = f"{first_author or '저자 정보 없음'} · {affiliation}"
+    header_bits = [f"<{article['url']}|{article['title']}>"]
+    if article.get("journal"):
+        header_bits.append(article["journal"])
+    if article.get("pubdate"):
+        header_bits.append(article["pubdate"])
+    header = " - ".join(header_bits)
     body = (
-        f"*[{index}/{total}] <{article['url']}|{article['title']}>* — {article['pubdate']}\n"
+        f"*[{index}/{total}] {header}*\n"
         f"_{byline}_\n\n"
         f"*[핵심 요약]*\n{summary_kr}"
     )
