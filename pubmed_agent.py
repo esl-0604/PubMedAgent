@@ -27,6 +27,7 @@ ROOT = Path(__file__).parent
 CONFIG_PATH = ROOT / "config.yaml"
 STATE_PATH = ROOT / "state" / "sent_pmids.json"
 LOGIC_HASH_PATH = ROOT / "state" / "logic_hash.json"
+ANALYZED_PATH = ROOT / "state" / "analyzed_pmids.json"
 ENV_PATH = ROOT / ".env"
 
 # 검색 로직을 구성하는 설정 키. 이 값들이 바뀌면 Slack에 변경 공지 전송.
@@ -64,6 +65,20 @@ def load_sent_pmids() -> set[str]:
         return set()
     with open(STATE_PATH, "r", encoding="utf-8") as f:
         return set(json.load(f))
+
+
+def load_analyzed_pmids() -> set[str]:
+    """analyze_bot이 DM으로 분석해 채널에 올린 PMID 집합.
+
+    pubmed_agent이 일일 수집할 때 이 목록도 함께 제외해 중복 전송 방지.
+    """
+    if not ANALYZED_PATH.exists():
+        return set()
+    try:
+        with open(ANALYZED_PATH, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except (json.JSONDecodeError, OSError):
+        return set()
 
 
 def save_sent_pmids(pmids: set[str]) -> None:
@@ -418,8 +433,10 @@ def main() -> int:
     print(f"[merge] {len(pmids)} PMIDs after union/cap")
 
     sent = load_sent_pmids()
-    new_pmids = [p for p in pmids if p not in sent]
-    print(f"[filter] {len(new_pmids)} new (after dedup)")
+    analyzed = load_analyzed_pmids()
+    exclude = sent | analyzed
+    new_pmids = [p for p in pmids if p not in exclude]
+    print(f"[filter] {len(new_pmids)} new (after dedup vs sent={len(sent)}, analyzed={len(analyzed)})")
 
     if not new_pmids:
         print("신규 논문 없음. Slack 전송 생략.")

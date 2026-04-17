@@ -16,11 +16,13 @@ DM으로 논문 제목/PMID/URL/초록 텍스트 중 하나를 보내면:
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
 import re
 import sys
+import threading
 import traceback
 
 # Windows 콘솔 CP949에서도 한글·이모지 출력되도록 UTF-8로 재구성
@@ -115,6 +117,88 @@ def _extract_text_from_bytes(data: bytes, file_info: dict) -> str:
 
 
 UNPAYWALL_EMAIL = os.environ.get("UNPAYWALL_EMAIL", "eunsang.lee@endorobo.com")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "esl-0604/PubMedAgent")
+ANALYZED_API_PATH = "state/analyzed_pmids.json"
+_REMEMBER_LOCK = threading.Lock()
+
+
+def remember_analyzed_pmid(pmid: str) -> None:
+    """분석 완료한 PMID를 GitHub 리포의 state/analyzed_pmids.json에 append.
+
+    GitHub REST API `contents`를 사용해 SHA 기반 낙관적 락으로 처리.
+    GITHUB_TOKEN 없거나 실패 시 경고만 찍고 스킵 (다음 DM 처리엔 영향 없음).
+    """
+    if not pmid:
+        return
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print(f"[remember] GITHUB_TOKEN 미설정 — PMID {pmid} 기록 생략",
+              file=sys.stderr)
+        return
+
+    with _REMEMBER_LOCK:
+        api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{ANALYZED_API_PATH}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        for attempt in range(3):
+            # 1) 현재 파일 상태 조회
+            sha = None
+            existing: list[str] = []
+            try:
+                r = requests.get(api, headers=headers, timeout=30)
+            except Exception as e:
+                print(f"[remember] GET 실패: {e}", file=sys.stderr)
+                return
+            if r.status_code == 200:
+                j = r.json()
+                sha = j.get("sha")
+                try:
+                    raw = base64.b64decode(j.get("content") or "").decode("utf-8")
+                    existing = json.loads(raw) if raw.strip() else []
+                except Exception:
+                    existing = []
+            elif r.status_code != 404:
+                print(f"[remember] GET HTTP {r.status_code}: {r.text[:200]}",
+                      file=sys.stderr)
+                return
+
+            if pmid in existing:
+                return  # 이미 기록됨
+
+            try:
+                merged = sorted(set(existing + [pmid]), key=int)[-5000:]
+            except ValueError:
+                merged = list(dict.fromkeys(existing + [pmid]))
+
+            content = json.dumps(merged, ensure_ascii=False)
+            payload = {
+                "message": f"chore: analyze_bot PMID {pmid} 추가 [skip ci]",
+                "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+                "branch": "main",
+            }
+            if sha:
+                payload["sha"] = sha
+
+            try:
+                r = requests.put(api, headers=headers, json=payload, timeout=30)
+            except Exception as e:
+                print(f"[remember] PUT 실패: {e}", file=sys.stderr)
+                return
+            if r.status_code in (200, 201):
+                print(f"[remember] PMID {pmid} GitHub 등록 성공", file=sys.stderr)
+                return
+            if r.status_code == 409:
+                # SHA conflict — 다른 커밋이 먼저 들어옴. 재시도.
+                print(f"[remember] SHA 충돌, 재시도 {attempt+1}/3",
+                      file=sys.stderr)
+                continue
+            print(f"[remember] PUT HTTP {r.status_code}: {r.text[:200]}",
+                  file=sys.stderr)
+            return
+        print(f"[remember] 3회 충돌, PMID {pmid} 기록 실패", file=sys.stderr)
 
 
 def _download_pdf(url: str, headers: dict | None = None) -> bytes | None:
@@ -575,6 +659,10 @@ def handle_message(event, say, client):
         post_to_channel(article, full_body, user_id, client,
                         attachment_bytes=attachment_bytes,
                         attachment_ext=attachment_ext)
+        # 분석한 PMID를 GitHub에 기록해 pubmed_agent 일일 수집과 중복 방지
+        pmid = article.get("pmid")
+        if pmid:
+            remember_analyzed_pmid(pmid)
     except Exception as e:
         traceback.print_exc()
         say(f"❌ 분석 중 오류: `{e}`")

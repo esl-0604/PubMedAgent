@@ -1,10 +1,9 @@
 name: Daily PubMed check
 
 on:
-  schedule:
-    # KST 10:00 = UTC 01:00
-    - cron: "0 1 * * *"
-  workflow_dispatch:  # 수동 실행 버튼 활성화
+  # 정기 스케줄은 GCE VM cron으로 이전 (GHA schedule drift 회피).
+  # 이 워크플로우는 수동 트리거 전용(backup).
+  workflow_dispatch:
 
 permissions:
   contents: write  # sent_pmids.json 커밋용
