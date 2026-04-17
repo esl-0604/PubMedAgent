@@ -783,13 +783,34 @@ def post_to_channel(article: dict, analysis: str, requester_id: str,
     )
     thread_ts = parent["ts"]
 
-    # Slack section 블록 텍스트 한계(3000자) 방어: 필요시 분할.
-    # 마지막 청크에만 divider 붙여서 다음 메시지와 시각 분리.
+    # 분석 텍스트 + 원문 첨부를 가능하면 단일 쓰레드 메시지로 묶어 시간차 최소화.
+    # initial_comment로 files_upload_v2에 실으면 "파일+텍스트"가 한 번에 전송됨.
     chunks = _chunk(analysis, 2800)
-    for i, chunk in enumerate(chunks):
+    upload_done = False
+    if attachment_bytes:
+        filename = _safe_filename(title) + (attachment_ext or ".bin")
+        try:
+            web_client.files_upload_v2(
+                channel=CHANNEL,
+                thread_ts=thread_ts,
+                file=attachment_bytes,
+                filename=filename,
+                title=filename,
+                initial_comment=chunks[0] if chunks else "",
+            )
+            upload_done = True
+        except Exception as e:
+            print(f"[upload] 결합 업로드 실패, 분리 폴백: {e}", file=sys.stderr)
+            traceback.print_exc()
+
+    # 업로드 성공 → 첫 청크는 initial_comment로 이미 전송됨. 남은 청크만 추가 포스팅.
+    # 업로드 실패/첨부 없음 → 처음부터 모든 청크를 일반 메시지로 전송. 업로드 실패 시 마지막에 파일 재시도.
+    start_idx = 1 if upload_done else 0
+    for i in range(start_idx, len(chunks)):
+        is_last_chunk = (i == len(chunks) - 1)
         blocks = [{"type": "section",
-                   "text": {"type": "mrkdwn", "text": chunk}}]
-        if i == len(chunks) - 1:
+                   "text": {"type": "mrkdwn", "text": chunks[i]}}]
+        if is_last_chunk and (upload_done or not attachment_bytes):
             blocks.append({"type": "divider"})
         web_client.chat_postMessage(
             channel=CHANNEL,
@@ -799,8 +820,8 @@ def post_to_channel(article: dict, analysis: str, requester_id: str,
             unfurl_links=False, unfurl_media=False,
         )
 
-    # 원문 첨부 (있을 때만). 파일명은 논문 제목 기준으로 정리.
-    if attachment_bytes:
+    # 폴백: 결합 업로드가 실패했으면 파일만 별도 첨부
+    if attachment_bytes and not upload_done:
         filename = _safe_filename(title) + (attachment_ext or ".bin")
         try:
             web_client.files_upload_v2(
@@ -811,8 +832,7 @@ def post_to_channel(article: dict, analysis: str, requester_id: str,
                 title=filename,
             )
         except Exception as e:
-            print(f"[upload] 첨부 업로드 실패: {e}", file=sys.stderr)
-            traceback.print_exc()
+            print(f"[upload] 파일 단독 업로드도 실패: {e}", file=sys.stderr)
 
     # 부모 메시지의 permalink 조회 (중복 재요청 시 링크 제공용)
     permalink = ""
