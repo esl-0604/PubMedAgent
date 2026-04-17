@@ -449,10 +449,6 @@ def handle_message(event, say, client):
         # 파일이 없거나 추출 실패면 텍스트 경로
         if article is None and text:
             article = resolve_input(text)
-            # 사용자가 긴 원문 텍스트를 직접 붙여넣은 경우 → .txt로 첨부
-            if article and article.get("title") == "(DM 입력 텍스트 분석)":
-                attachment_bytes = text.encode("utf-8")
-                attachment_ext = ".txt"
 
         if not article:
             say("⚠️ 입력에서 논문을 식별하지 못했습니다. 제목 / PMID / PubMed URL / 초록 원문 / PDF 파일 중 하나를 보내주세요.")
