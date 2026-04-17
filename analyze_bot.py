@@ -185,12 +185,14 @@ def lookup_analyzed_entry(pmid: str) -> dict | None:
 
 
 def remember_analyzed_pmid(pmid: str, thread_ts: str = "",
-                           permalink: str = "", has_pdf: bool = False) -> None:
+                           permalink: str = "", has_pdf: bool = False,
+                           force: bool = False) -> None:
     """PMID를 state/analyzed_pmids.json에 add/merge.
 
     스키마: {pmid: {"ts", "permalink", "analyzed_at", "has_pdf"}}
     - 신규: 모든 필드 설정
-    - 갱신: ts/permalink/analyzed_at은 기존 우선 보존, has_pdf는 True 우선(승격)
+    - 갱신(force=False): ts/permalink/analyzed_at은 기존 우선, has_pdf는 True 우선
+    - 덮어쓰기(force=True): 이전 엔트리를 완전히 대체 (쓰레드 삭제 후 재분석용)
     GitHub REST API로 SHA 기반 낙관적 락. GITHUB_TOKEN 없으면 스킵.
     """
     if not pmid:
@@ -216,13 +218,21 @@ def remember_analyzed_pmid(pmid: str, thread_ts: str = "",
                 return
 
             cur = existing.get(pmid) if isinstance(existing.get(pmid), dict) else {}
-            new_entry = {
-                "ts": (cur.get("ts") if cur else "") or thread_ts,
-                "permalink": (cur.get("permalink") if cur else "") or permalink,
-                "analyzed_at": (cur.get("analyzed_at") if cur else "")
-                               or datetime.now(timezone.utc).isoformat(),
-                "has_pdf": bool((cur.get("has_pdf") if cur else False) or has_pdf),
-            }
+            if force:
+                new_entry = {
+                    "ts": thread_ts,
+                    "permalink": permalink,
+                    "analyzed_at": datetime.now(timezone.utc).isoformat(),
+                    "has_pdf": bool(has_pdf),
+                }
+            else:
+                new_entry = {
+                    "ts": (cur.get("ts") if cur else "") or thread_ts,
+                    "permalink": (cur.get("permalink") if cur else "") or permalink,
+                    "analyzed_at": (cur.get("analyzed_at") if cur else "")
+                                   or datetime.now(timezone.utc).isoformat(),
+                    "has_pdf": bool((cur.get("has_pdf") if cur else False) or has_pdf),
+                }
             if cur == new_entry:
                 return  # 변경 없음
             existing[pmid] = new_entry
@@ -352,6 +362,37 @@ def _unpaywall_pdf_bytes(doi: str) -> bytes | None:
     except Exception as e:
         print(f"[unpaywall] 실패: {e}", file=sys.stderr)
         return None
+
+
+def _thread_exists(web_client, thread_ts: str) -> bool:
+    """채널의 해당 thread_ts 부모 메시지가 아직 살아있는지 확인.
+
+    필요 스코프: `channels:history` (또는 private이면 `groups:history`).
+    스코프 부족 등 확인 불가한 경우 보수적으로 True(존재) 반환해 중복 분석 방지.
+    """
+    if not thread_ts:
+        return False
+    try:
+        r = web_client.conversations_replies(
+            channel=CHANNEL, ts=thread_ts, limit=1
+        )
+        msgs = r.get("messages") or []
+        if not msgs:
+            return False
+        if msgs[0].get("subtype") == "tombstone":
+            return False
+        return True
+    except Exception as e:
+        err = str(e).lower()
+        if "thread_not_found" in err or "message_not_found" in err:
+            return False
+        if "missing_scope" in err or "not_in_channel" in err:
+            print(f"[thread-exists] 스코프 부족 — 존재한다고 간주: {e}",
+                  file=sys.stderr)
+            return True
+        print(f"[thread-exists] 확인 실패 — 보수적으로 존재로 판단: {e}",
+              file=sys.stderr)
+        return True
 
 
 def _try_open_access_pdf(article: dict) -> tuple[bytes | None, str, str]:
@@ -762,45 +803,53 @@ def handle_message(event, say, client):
 
         # 이전에 analyze_bot으로 이미 분석한 PMID인지 확인
         pmid = article.get("pmid") or ""
+        force_remember = False  # 이전 쓰레드 삭제 감지 시 새 엔트리로 덮어쓰기
         if pmid:
             prev = lookup_analyzed_entry(pmid)
             if prev is not None:
                 prev_permalink = (prev or {}).get("permalink") or ""
                 prev_ts = (prev or {}).get("ts") or ""
                 prev_has_pdf = bool((prev or {}).get("has_pdf"))
-                has_current_pdf = attachment_bytes is not None and attachment_ext == ".pdf"
 
-                # Case: 기존에 PDF 없었고 이번 요청에 PDF가 있으면 → 이전 쓰레드에 PDF 추가
-                if has_current_pdf and not prev_has_pdf and prev_ts:
-                    try:
-                        filename = _safe_filename(article.get("title") or "paper") + ".pdf"
-                        client.files_upload_v2(
-                            channel=CHANNEL,
-                            thread_ts=prev_ts,
-                            file=attachment_bytes,
-                            filename=filename,
-                            title=filename,
-                            initial_comment="📎 사용자 요청으로 원문 PDF를 추가 첨부했습니다.",
-                        )
-                        remember_analyzed_pmid(pmid, has_pdf=True)
-                        msg = ("⏱ 이 논문은 이전에 이미 분석되었습니다. "
-                               "원문 PDF가 없었어서 이번 요청의 PDF를 해당 쓰레드에 추가했습니다.")
-                        if prev_permalink:
-                            msg += f"\n→ 이전 분석 쓰레드: {prev_permalink}"
-                        say(msg)
-                        return
-                    except Exception as e:
-                        print(f"[dedup] 기존 쓰레드에 PDF 추가 실패: {e}",
-                              file=sys.stderr)
-                        traceback.print_exc()
-                        # 실패 시 아래 일반 안내로 폴백
+                # 이전 쓰레드가 삭제되었으면 재분석 진행 (아래 로직 스킵)
+                if prev_ts and not _thread_exists(client, prev_ts):
+                    print(f"[dedup] 이전 쓰레드 {prev_ts} 삭제됨 — 재분석 진행",
+                          file=sys.stderr)
+                    force_remember = True
+                else:
+                    has_current_pdf = attachment_bytes is not None and attachment_ext == ".pdf"
 
-                # 그 외: 그냥 이전 쓰레드 링크만 안내
-                msg = "⏱ 이 논문은 이전에 이미 분석 완료되었습니다."
-                if prev_permalink:
-                    msg += f"\n→ 이전 분석 쓰레드: {prev_permalink}"
-                say(msg)
-                return
+                    # Case: 기존에 PDF 없었고 이번 요청에 PDF가 있으면 → 이전 쓰레드에 PDF 추가
+                    if has_current_pdf and not prev_has_pdf and prev_ts:
+                        try:
+                            filename = _safe_filename(article.get("title") or "paper") + ".pdf"
+                            client.files_upload_v2(
+                                channel=CHANNEL,
+                                thread_ts=prev_ts,
+                                file=attachment_bytes,
+                                filename=filename,
+                                title=filename,
+                                initial_comment="📎 사용자 요청으로 원문 PDF를 추가 첨부했습니다.",
+                            )
+                            remember_analyzed_pmid(pmid, has_pdf=True)
+                            msg = ("⏱ 이 논문은 이전에 이미 분석되었습니다. "
+                                   "원문 PDF가 없었어서 이번 요청의 PDF를 해당 쓰레드에 추가했습니다.")
+                            if prev_permalink:
+                                msg += f"\n→ 이전 분석 쓰레드: {prev_permalink}"
+                            say(msg)
+                            return
+                        except Exception as e:
+                            print(f"[dedup] 기존 쓰레드에 PDF 추가 실패: {e}",
+                                  file=sys.stderr)
+                            traceback.print_exc()
+                            # 실패 시 아래 일반 안내로 폴백
+
+                    # 그 외: 그냥 이전 쓰레드 링크만 안내
+                    msg = "⏱ 이 논문은 이전에 이미 분석 완료되었습니다."
+                    if prev_permalink:
+                        msg += f"\n→ 이전 분석 쓰레드: {prev_permalink}"
+                    say(msg)
+                    return
 
         # 첨부 결정 및 상태 문구 생성.
         if attachment_bytes is not None:
@@ -818,7 +867,8 @@ def handle_message(event, say, client):
         # 분석 이력을 GitHub에 기록 (pubmed_agent 일일 수집 dedup + 재요청 시 링크 제공)
         if pmid:
             remember_analyzed_pmid(pmid, thread_ts, permalink,
-                                   has_pdf=bool(attachment_bytes))
+                                   has_pdf=bool(attachment_bytes),
+                                   force=force_remember)
     except Exception as e:
         traceback.print_exc()
         say(f"❌ 분석 중 오류: `{e}`")
