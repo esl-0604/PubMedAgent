@@ -260,13 +260,17 @@ def parse_articles(xml_text: str) -> list[dict]:
                     first_affiliation = _shorten_affiliation(aff)
         pubdate = _format_pubdate(art)
         pmc_id = ""
+        doi = ""
         for aid in art.findall(".//ArticleIdList/ArticleId"):
-            if aid.get("IdType") == "pmc":
+            id_type = aid.get("IdType")
+            if id_type == "pmc" and not pmc_id:
                 pmc_id = _text(aid).replace("PMC", "")
-                break
+            elif id_type == "doi" and not doi:
+                doi = _text(aid)
         out.append({
             "pmid": pmid,
             "pmc_id": pmc_id,
+            "doi": doi,
             "title": title,
             "abstract": abstract,
             "authors": authors,

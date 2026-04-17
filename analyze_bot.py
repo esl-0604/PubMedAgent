@@ -114,8 +114,36 @@ def _extract_text_from_bytes(data: bytes, file_info: dict) -> str:
     raise ValueError(f"지원하지 않는 파일 타입: {filetype or mimetype or name}")
 
 
+UNPAYWALL_EMAIL = os.environ.get("UNPAYWALL_EMAIL", "eunsang.lee@endorobo.com")
+
+
+def _download_pdf(url: str, headers: dict | None = None) -> bytes | None:
+    """주어진 URL에서 PDF 바이너리 다운로드. PDF 헤더(%PDF) 검증."""
+    try:
+        r = requests.get(url, timeout=60, stream=True,
+                         headers=headers or {"User-Agent": "Mozilla/5.0"},
+                         allow_redirects=True)
+        if r.status_code != 200:
+            print(f"[pdf-dl] HTTP {r.status_code} from {url}", file=sys.stderr)
+            return None
+        data = b""
+        for chunk in r.iter_content(chunk_size=65536):
+            data += chunk
+            if len(data) > MAX_FILE_BYTES:
+                print(f"[pdf-dl] 크기 초과", file=sys.stderr)
+                return None
+        if not data.startswith(b"%PDF"):
+            print(f"[pdf-dl] PDF 아님 (HTML landing page 추정): {url}",
+                  file=sys.stderr)
+            return None
+        return data
+    except Exception as e:
+        print(f"[pdf-dl] 실패: {e}", file=sys.stderr)
+        return None
+
+
 def _pmc_pdf_bytes(pmc_id: str) -> bytes | None:
-    """PMC Open-Access 서비스로 PDF URL 조회 후 다운로드. OA 아니면 None."""
+    """PMC Open-Access 서비스로 PDF URL 조회 후 다운로드."""
     if not pmc_id:
         return None
     pmc_id = pmc_id.replace("PMC", "")
@@ -126,31 +154,71 @@ def _pmc_pdf_bytes(pmc_id: str) -> bytes | None:
             timeout=30,
         )
         if r.status_code != 200:
+            print(f"[pmc] oa.fcgi HTTP {r.status_code}", file=sys.stderr)
             return None
         import xml.etree.ElementTree as ET
         root = ET.fromstring(r.text)
         if root.find(".//error") is not None:
+            print(f"[pmc] PMC{pmc_id}: OA 서브셋 아님", file=sys.stderr)
             return None
         pdf_link = root.find(".//link[@format='pdf']")
         if pdf_link is None:
+            print(f"[pmc] PMC{pmc_id}: PDF 링크 없음", file=sys.stderr)
             return None
         href = pdf_link.get("href")
         if not href:
             return None
         if href.startswith("ftp://"):
             href = href.replace("ftp://", "https://", 1)
-        pdf_r = requests.get(href, timeout=60, stream=True)
-        if pdf_r.status_code != 200:
-            return None
-        data = b""
-        for chunk in pdf_r.iter_content(chunk_size=65536):
-            data += chunk
-            if len(data) > MAX_FILE_BYTES:
-                return None
-        return data
+        return _download_pdf(href)
     except Exception as e:
         print(f"[pmc] 다운로드 실패: {e}", file=sys.stderr)
         return None
+
+
+def _unpaywall_pdf_bytes(doi: str) -> bytes | None:
+    """Unpaywall API로 DOI에 대응하는 open-access PDF 찾기. PMC 밖 OA도 커버."""
+    if not doi:
+        return None
+    try:
+        r = requests.get(
+            f"https://api.unpaywall.org/v2/{doi}",
+            params={"email": UNPAYWALL_EMAIL},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            print(f"[unpaywall] HTTP {r.status_code} for {doi}", file=sys.stderr)
+            return None
+        data = r.json()
+        if not data.get("is_oa"):
+            print(f"[unpaywall] {doi}: OA 아님", file=sys.stderr)
+            return None
+        # best_oa_location 우선, 없으면 oa_locations 순회
+        locations = []
+        if data.get("best_oa_location"):
+            locations.append(data["best_oa_location"])
+        locations.extend(data.get("oa_locations") or [])
+        for loc in locations:
+            pdf_url = loc.get("url_for_pdf")
+            if not pdf_url:
+                continue
+            print(f"[unpaywall] {doi}: 시도 {pdf_url}", file=sys.stderr)
+            pdf = _download_pdf(pdf_url)
+            if pdf:
+                return pdf
+        print(f"[unpaywall] {doi}: 다운로드 가능한 PDF 없음", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"[unpaywall] 실패: {e}", file=sys.stderr)
+        return None
+
+
+def _extract_doi_from_url(url: str) -> str:
+    """PDF 메타 추출 등에서 나온 https://doi.org/<doi> 형태에서 DOI 추출."""
+    if not url:
+        return ""
+    m = re.search(r"doi\.org/(.+)$", url)
+    return m.group(1).strip() if m else ""
 
 
 def _esearch_by_title(title: str) -> str | None:
@@ -200,6 +268,7 @@ def resolve_input(text: str) -> dict | None:
         return {
             "pmid": "",
             "pmc_id": "",
+            "doi": "",
             "title": "(DM 입력 텍스트 분석)",
             "abstract": text,
             "authors": [],
@@ -435,16 +504,18 @@ def handle_message(event, say, client):
                     meta = {}
                 title_hint = (meta.get("title")
                               or (text if text else "(첨부 파일)"))[:300]
+                meta_url = meta.get("url") or ""
                 article = {
                     "pmid": "",
                     "pmc_id": "",
+                    "doi": _extract_doi_from_url(meta_url),
                     "title": title_hint,
                     "abstract": extracted,
                     "authors": meta.get("authors") or [],
                     "affiliation": meta.get("affiliation") or "",
                     "journal": meta.get("journal") or "",
                     "pubdate": meta.get("pubdate") or "",
-                    "url": meta.get("url") or "",
+                    "url": meta_url,
                 }
         # 파일이 없거나 추출 실패면 텍스트 경로
         if article is None and text:
@@ -454,12 +525,27 @@ def handle_message(event, say, client):
             say("⚠️ 입력에서 논문을 식별하지 못했습니다. 제목 / PMID / PubMed URL / 초록 원문 / PDF 파일 중 하나를 보내주세요.")
             return
 
-        # 첨부가 아직 없고, PMC open-access ID가 있으면 PDF 다운로드 시도
-        if attachment_bytes is None and article.get("pmc_id"):
-            pdf = _pmc_pdf_bytes(article["pmc_id"])
-            if pdf:
-                attachment_bytes = pdf
-                attachment_ext = ".pdf"
+        # 첨부가 아직 없으면 open-access PDF 다운로드 시도: PMC → Unpaywall 순.
+        if attachment_bytes is None:
+            pmc_id = article.get("pmc_id")
+            doi = article.get("doi")
+            print(f"[attach] pmc_id={pmc_id!r} doi={doi!r}", file=sys.stderr)
+            if pmc_id:
+                pdf = _pmc_pdf_bytes(pmc_id)
+                if pdf:
+                    attachment_bytes = pdf
+                    attachment_ext = ".pdf"
+                    print(f"[attach] PMC에서 PDF 확보 ({len(pdf)} bytes)",
+                          file=sys.stderr)
+            if attachment_bytes is None and doi:
+                pdf = _unpaywall_pdf_bytes(doi)
+                if pdf:
+                    attachment_bytes = pdf
+                    attachment_ext = ".pdf"
+                    print(f"[attach] Unpaywall에서 PDF 확보 ({len(pdf)} bytes)",
+                          file=sys.stderr)
+            if attachment_bytes is None:
+                print("[attach] 첨부 가능한 PDF 없음", file=sys.stderr)
 
         analysis = analyze_article(article)
         post_to_channel(article, analysis, user_id, client,
