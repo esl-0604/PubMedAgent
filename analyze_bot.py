@@ -213,6 +213,42 @@ def _unpaywall_pdf_bytes(doi: str) -> bytes | None:
         return None
 
 
+def _try_open_access_pdf(article: dict) -> tuple[bytes | None, str, str]:
+    """PMC → Unpaywall 순서로 원문 PDF 확보 시도.
+
+    Returns: (pdf_bytes_or_None, ext, human_readable_note).
+    실패해도 note는 항상 비어있지 않은 설명 문자열.
+    """
+    pmc_id = article.get("pmc_id") or ""
+    doi = article.get("doi") or ""
+    print(f"[attach] pmc_id={pmc_id!r} doi={doi!r}", file=sys.stderr)
+
+    if pmc_id:
+        pdf = _pmc_pdf_bytes(pmc_id)
+        if pdf:
+            print(f"[attach] PMC에서 PDF 확보 ({len(pdf)} bytes)", file=sys.stderr)
+            return pdf, ".pdf", "PMC Open-Access에서 다운로드한 원문 PDF를 이 쓰레드에 첨부했습니다."
+
+    if doi:
+        pdf = _unpaywall_pdf_bytes(doi)
+        if pdf:
+            print(f"[attach] Unpaywall에서 PDF 확보 ({len(pdf)} bytes)", file=sys.stderr)
+            return pdf, ".pdf", "Unpaywall로 확보한 Open-Access 원문 PDF를 이 쓰레드에 첨부했습니다."
+
+    # 실패 — 이유 정리
+    print("[attach] 첨부 가능한 PDF 없음", file=sys.stderr)
+    if not pmc_id and not doi:
+        reason = "DOI/PMC ID를 확인할 수 없어 원문을 탐색하지 못했습니다."
+    else:
+        bits = []
+        if pmc_id:
+            bits.append("PMC Open-Access 서브셋에 포함되지 않음")
+        if doi:
+            bits.append("Unpaywall에서 Open-Access 전문 미확인")
+        reason = "Open-Access 원문을 찾지 못했습니다 (" + ", ".join(bits) + ")."
+    return None, "", reason
+
+
 def _extract_doi_from_url(url: str) -> str:
     """PDF 메타 추출 등에서 나온 https://doi.org/<doi> 형태에서 DOI 추출."""
     if not url:
@@ -328,17 +364,20 @@ def extract_metadata_from_text(text: str) -> dict:
 
 
 def analyze_article(article: dict) -> str:
-    """Claude로 EndoRobotics 관점 상세 분석 (Slack mrkdwn)."""
+    """Claude로 EndoRobotics 관점 상세 분석 (Slack mrkdwn).
+
+    아래 4개 섹션만 순서대로 작성. `[원문 첨부]` 섹션은 코드에서 별도로 앞에 붙인다.
+    """
     system = (
         "당신은 한국의 의료기기 회사 EndoRobotics의 R&D 엔지니어 관점에서 임상 논문을 분석합니다. "
         "EndoRobotics는 연성 내시경 기반 수술 로봇·기구를 개발하며, "
         "ESD·POEM·endoscopic suturing·NOTES 등 GI 시술이 주력 분야입니다. "
-        "Slack mrkdwn 형식으로 아래 섹션을 모두 포함해 한국어로 작성하세요. "
-        "각 섹션 헤더는 *[제목]* 형식, 불릿은 • 사용.\n\n"
+        "Slack mrkdwn 형식으로 아래 4개 섹션을 **정확히 이 순서대로**, **제목도 문자 그대로** 한국어로 작성하세요. "
+        "각 섹션 헤더는 `*[제목]*` 형식(별표 포함), 불릿은 • 사용. 다른 섹션은 추가 금지.\n\n"
         "*[핵심 요약]* — 3~4줄\n"
-        "*[방법·결과]* — 3~5줄\n"
-        "*[EndoRobotics 관점 시사점]* — 회사 제품·파이프라인과의 연결점, 3~5줄\n"
-        "*[한계 및 후속 과제]* — 2~3줄"
+        "*[방법 / 결과]* — 3~5줄\n"
+        "*[한계 / 후속 과제]* — 2~3줄\n"
+        "*[EndoRobotics 관점 시사점]* — 회사 제품·파이프라인과의 연결점, 3~5줄"
     )
     user = (
         f"제목: {article.get('title')}\n"
@@ -525,30 +564,15 @@ def handle_message(event, say, client):
             say("⚠️ 입력에서 논문을 식별하지 못했습니다. 제목 / PMID / PubMed URL / 초록 원문 / PDF 파일 중 하나를 보내주세요.")
             return
 
-        # 첨부가 아직 없으면 open-access PDF 다운로드 시도: PMC → Unpaywall 순.
-        if attachment_bytes is None:
-            pmc_id = article.get("pmc_id")
-            doi = article.get("doi")
-            print(f"[attach] pmc_id={pmc_id!r} doi={doi!r}", file=sys.stderr)
-            if pmc_id:
-                pdf = _pmc_pdf_bytes(pmc_id)
-                if pdf:
-                    attachment_bytes = pdf
-                    attachment_ext = ".pdf"
-                    print(f"[attach] PMC에서 PDF 확보 ({len(pdf)} bytes)",
-                          file=sys.stderr)
-            if attachment_bytes is None and doi:
-                pdf = _unpaywall_pdf_bytes(doi)
-                if pdf:
-                    attachment_bytes = pdf
-                    attachment_ext = ".pdf"
-                    print(f"[attach] Unpaywall에서 PDF 확보 ({len(pdf)} bytes)",
-                          file=sys.stderr)
-            if attachment_bytes is None:
-                print("[attach] 첨부 가능한 PDF 없음", file=sys.stderr)
+        # 첨부 결정 및 상태 문구 생성.
+        if attachment_bytes is not None:
+            attach_note = "사용자가 업로드한 원문 PDF를 이 쓰레드에 첨부했습니다."
+        else:
+            attachment_bytes, attachment_ext, attach_note = _try_open_access_pdf(article)
 
-        analysis = analyze_article(article)
-        post_to_channel(article, analysis, user_id, client,
+        analysis_body = analyze_article(article)
+        full_body = f"*[원문 첨부]*\n{attach_note}\n\n{analysis_body}"
+        post_to_channel(article, full_body, user_id, client,
                         attachment_bytes=attachment_bytes,
                         attachment_ext=attachment_ext)
     except Exception as e:
