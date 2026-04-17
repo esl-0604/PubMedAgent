@@ -122,7 +122,9 @@ UNPAYWALL_EMAIL = os.environ.get("UNPAYWALL_EMAIL", "eunsang.lee@endorobo.com")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "esl-0604/PubMedAgent")
 ANALYZED_API_PATH = "state/analyzed_pmids.json"
 ANALYZED_LOCAL_PATH = Path(__file__).parent / "state" / "analyzed_pmids.json"
+INTERESTS_API_PATH = "state/paper_interests.jsonl"
 _REMEMBER_LOCK = threading.Lock()
+_INTERESTS_LOCK = threading.Lock()
 
 
 def _github_get_analyzed() -> tuple[dict, str | None]:
@@ -429,6 +431,136 @@ def _try_open_access_pdf(article: dict) -> tuple[bytes | None, str, str]:
             bits.append("Unpaywall에서 Open-Access 전문 미확인")
         reason = "Open-Access 원문을 찾지 못했습니다 (" + ", ".join(bits) + ")."
     return None, "", reason
+
+
+def extract_interest_features(article: dict) -> dict:
+    """논문 메타·초록에서 관심 특징(topics/techniques/focus 등)을 Claude로 추출."""
+    title = article.get("title") or ""
+    journal = article.get("journal") or ""
+    abstract = article.get("abstract") or ""
+    if not (title or abstract):
+        return {}
+    system = (
+        "너는 EndoRobotics R&D 엔지니어가 관심 갖는 논문들의 특징을 태그로 추출하는 도우미다. "
+        "반드시 아래 키를 가진 JSON만 출력:\n"
+        "{\n"
+        '  "topics": [str, ...],          # 논문 주제 태그 2~5개\n'
+        '  "techniques": [str, ...],      # 구체적 기술·기구·수술법 0~5개\n'
+        '  "study_type": str,             # RCT | prospective | retrospective | meta-analysis | ex-vivo | in-vivo | technical report | review | etc.\n'
+        '  "domain": str,                 # GI endoscopy | surgical robotics | medical AI | imaging | etc.\n'
+        '  "focus": str,                  # technical | clinical | mixed\n'
+        '  "signals": [str, ...],         # EndoRobotics 관점 주목 포인트 1~3개 (왜 이 논문이 관심있을지)\n'
+        '  "endorobotics_relevance": str  # 한 줄로 회사와의 관련성 요약\n'
+        "}\n"
+        "태그는 영어로 짧고 구체적으로. 설명·코드블록 없이 JSON만."
+    )
+    user = (f"제목: {title}\n저널: {journal}\n초록: {abstract[:3000]}")
+    try:
+        resp = claude.messages.create(
+            model=MODEL, max_tokens=700, system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        log_usage(script="analyze_bot", model=MODEL,
+                  input_tokens=resp.usage.input_tokens,
+                  output_tokens=resp.usage.output_tokens,
+                  request_type="interest_features")
+        raw = resp.content[0].text.strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL)
+        return json.loads(raw)
+    except Exception as e:
+        print(f"[interest] 특징 추출 실패: {e}", file=sys.stderr)
+        return {}
+
+
+def record_paper_interest(article: dict, features: dict) -> None:
+    """분석한 논문의 특징을 state/paper_interests.jsonl에 append (GitHub REST API).
+
+    동일 PMID가 이미 기록되어 있으면 스킵. GITHUB_TOKEN 없으면 스킵.
+    """
+    if not features:
+        return
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print("[interest] GITHUB_TOKEN 미설정 — 기록 스킵", file=sys.stderr)
+        return
+
+    entry = {
+        "pmid": article.get("pmid") or "",
+        "doi": article.get("doi") or "",
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "title": article.get("title") or "",
+        "journal": article.get("journal") or "",
+        "pubdate": article.get("pubdate") or "",
+        "authors": article.get("authors") or [],
+        "affiliations": article.get("affiliations") or (
+            [article["affiliation"]] if article.get("affiliation") else []
+        ),
+        "url": article.get("url") or "",
+        "features": features,
+    }
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+
+    with _INTERESTS_LOCK:
+        api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{INTERESTS_API_PATH}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        pmid = entry["pmid"]
+        for attempt in range(3):
+            try:
+                r = requests.get(api, headers=headers, timeout=30)
+            except Exception as e:
+                print(f"[interest] GET 실패: {e}", file=sys.stderr)
+                return
+            sha = None
+            current = ""
+            if r.status_code == 200:
+                j = r.json()
+                sha = j.get("sha")
+                try:
+                    current = base64.b64decode(j.get("content") or "").decode("utf-8")
+                except Exception:
+                    current = ""
+            elif r.status_code != 404:
+                print(f"[interest] GET HTTP {r.status_code}", file=sys.stderr)
+                return
+
+            # PMID 중복 시 스킵
+            if pmid and f'"pmid": "{pmid}"' in current:
+                print(f"[interest] PMID {pmid} 이미 기록됨 — 스킵",
+                      file=sys.stderr)
+                return
+
+            if current and not current.endswith("\n"):
+                current = current + "\n"
+            new_content = current + line
+
+            payload = {
+                "message": f"chore: paper interest ({pmid or 'no-pmid'}) [skip ci]",
+                "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
+                "branch": "main",
+            }
+            if sha:
+                payload["sha"] = sha
+            try:
+                r = requests.put(api, headers=headers, json=payload, timeout=30)
+            except Exception as e:
+                print(f"[interest] PUT 실패: {e}", file=sys.stderr)
+                return
+            if r.status_code in (200, 201):
+                print(f"[interest] 기록 성공 (PMID={pmid or 'none'})",
+                      file=sys.stderr)
+                return
+            if r.status_code == 409:
+                print(f"[interest] SHA 충돌, 재시도 {attempt+1}/3",
+                      file=sys.stderr)
+                continue
+            print(f"[interest] PUT HTTP {r.status_code}: {r.text[:200]}",
+                  file=sys.stderr)
+            return
+        print(f"[interest] 3회 충돌, 기록 실패", file=sys.stderr)
 
 
 def _extract_doi_from_url(url: str) -> str:
@@ -869,6 +1001,14 @@ def handle_message(event, say, client):
             remember_analyzed_pmid(pmid, thread_ts, permalink,
                                    has_pdf=bool(attachment_bytes),
                                    force=force_remember)
+
+        # 관심 논문 특징 기록 (사용자 선호 프로파일 학습용, 실패해도 본 흐름 영향 없음)
+        try:
+            features = extract_interest_features(article)
+            if features:
+                record_paper_interest(article, features)
+        except Exception as e:
+            print(f"[interest] 처리 실패: {e}", file=sys.stderr)
     except Exception as e:
         traceback.print_exc()
         say(f"❌ 분석 중 오류: `{e}`")

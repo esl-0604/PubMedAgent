@@ -270,15 +270,23 @@ def parse_articles(xml_text: str) -> list[dict]:
         abstract = " ".join(_text(n) for n in abstract_nodes)
         authors = []
         first_affiliation = ""
+        all_affiliations: list[str] = []
+        seen_affs: set[str] = set()
         for au in art.findall(".//AuthorList/Author"):
             last = _text(au.find("LastName"))
             initials = _text(au.find("Initials"))
             if last:
                 authors.append(f"{last} {initials}".strip())
-            if not first_affiliation:
-                aff = _text(au.find("AffiliationInfo/Affiliation"))
-                if aff:
-                    first_affiliation = _shorten_affiliation(aff)
+            for aff_node in au.findall("AffiliationInfo/Affiliation"):
+                aff_text = _text(aff_node)
+                if not aff_text:
+                    continue
+                short = _shorten_affiliation(aff_text)
+                if short and short not in seen_affs:
+                    seen_affs.add(short)
+                    all_affiliations.append(short)
+                if not first_affiliation and short:
+                    first_affiliation = short
         pubdate = _format_pubdate(art)
         pmc_id = ""
         doi = ""
@@ -296,6 +304,7 @@ def parse_articles(xml_text: str) -> list[dict]:
             "abstract": abstract,
             "authors": authors,
             "affiliation": first_affiliation,
+            "affiliations": all_affiliations,
             "journal": journal,
             "pubdate": pubdate,
             "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
