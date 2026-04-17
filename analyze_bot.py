@@ -185,10 +185,12 @@ def lookup_analyzed_entry(pmid: str) -> dict | None:
 
 
 def remember_analyzed_pmid(pmid: str, thread_ts: str = "",
-                           permalink: str = "") -> None:
-    """PMID를 state/analyzed_pmids.json에 추가. dict 스키마로 저장.
+                           permalink: str = "", has_pdf: bool = False) -> None:
+    """PMID를 state/analyzed_pmids.json에 add/merge.
 
-    스키마: {pmid: {"ts": thread_ts, "permalink": permalink, "analyzed_at": ISO8601}}
+    스키마: {pmid: {"ts", "permalink", "analyzed_at", "has_pdf"}}
+    - 신규: 모든 필드 설정
+    - 갱신: ts/permalink/analyzed_at은 기존 우선 보존, has_pdf는 True 우선(승격)
     GitHub REST API로 SHA 기반 낙관적 락. GITHUB_TOKEN 없으면 스킵.
     """
     if not pmid:
@@ -213,16 +215,17 @@ def remember_analyzed_pmid(pmid: str, thread_ts: str = "",
                 print(f"[remember] GET 실패: {e}", file=sys.stderr)
                 return
 
-            # 이미 있고 permalink까지 있으면 건너뜀
-            cur = existing.get(pmid)
-            if isinstance(cur, dict) and cur.get("permalink"):
-                return
-
-            existing[pmid] = {
-                "ts": thread_ts,
-                "permalink": permalink,
-                "analyzed_at": datetime.now(timezone.utc).isoformat(),
+            cur = existing.get(pmid) if isinstance(existing.get(pmid), dict) else {}
+            new_entry = {
+                "ts": (cur.get("ts") if cur else "") or thread_ts,
+                "permalink": (cur.get("permalink") if cur else "") or permalink,
+                "analyzed_at": (cur.get("analyzed_at") if cur else "")
+                               or datetime.now(timezone.utc).isoformat(),
+                "has_pdf": bool((cur.get("has_pdf") if cur else False) or has_pdf),
             }
+            if cur == new_entry:
+                return  # 변경 없음
+            existing[pmid] = new_entry
 
             # 5000개 초과 시 오래된 것부터 제거 (insertion order 기준)
             if len(existing) > 5000:
@@ -393,6 +396,34 @@ def _extract_doi_from_url(url: str) -> str:
         return ""
     m = re.search(r"doi\.org/(.+)$", url)
     return m.group(1).strip() if m else ""
+
+
+def _esearch_by_doi(doi: str) -> str | None:
+    """DOI → PubMed PMID. 없으면 None."""
+    if not doi:
+        return None
+    params = {"db": "pubmed", "term": f"{doi}[doi]",
+              "retmax": 1, "retmode": "json"}
+    if NCBI_API_KEY:
+        params["api_key"] = NCBI_API_KEY
+    try:
+        r = requests.get(f"{EUTILS}/esearch.fcgi", params=params, timeout=30)
+        r.raise_for_status()
+        ids = r.json().get("esearchresult", {}).get("idlist", [])
+        return ids[0] if ids else None
+    except Exception as e:
+        print(f"[pmid-lookup] DOI 검색 실패: {e}", file=sys.stderr)
+        return None
+
+
+def _resolve_pmid_from_meta(title: str, doi: str) -> str:
+    """DOI 우선, 실패 시 제목으로 PMID 조회. 없으면 빈 문자열."""
+    pmid = _esearch_by_doi(doi) if doi else None
+    if pmid:
+        return pmid
+    if title:
+        return _esearch_by_title(title) or ""
+    return ""
 
 
 def _esearch_by_title(title: str) -> str | None:
@@ -689,21 +720,38 @@ def handle_message(event, say, client):
                 except Exception as me:
                     print(f"[analyze_bot] 메타 추출 실패: {me}", file=sys.stderr)
                     meta = {}
-                title_hint = (meta.get("title")
-                              or (text if text else "(첨부 파일)"))[:300]
+                meta_title = meta.get("title") or ""
                 meta_url = meta.get("url") or ""
-                article = {
-                    "pmid": "",
-                    "pmc_id": "",
-                    "doi": _extract_doi_from_url(meta_url),
-                    "title": title_hint,
-                    "abstract": extracted,
-                    "authors": meta.get("authors") or [],
-                    "affiliation": meta.get("affiliation") or "",
-                    "journal": meta.get("journal") or "",
-                    "pubdate": meta.get("pubdate") or "",
-                    "url": meta_url,
-                }
+                meta_doi = _extract_doi_from_url(meta_url)
+                # PMID 해소 시도 (DOI → title 순). 성공하면 efetch로 canonical 데이터 사용.
+                resolved_pmid = _resolve_pmid_from_meta(meta_title, meta_doi)
+                article = None
+                if resolved_pmid:
+                    try:
+                        fetched = efetch([resolved_pmid], NCBI_API_KEY)
+                        if fetched:
+                            article = fetched[0]
+                            # PubMed 초록보다 PDF 전문이 더 풍부하므로 교체
+                            article["abstract"] = extracted or article.get("abstract") or ""
+                            print(f"[resolve] PDF → PMID {resolved_pmid} 확보",
+                                  file=sys.stderr)
+                    except Exception as re_:
+                        print(f"[resolve] efetch 실패: {re_}", file=sys.stderr)
+                if article is None:
+                    # PMID 해소 실패 — Claude 메타로 채워진 최선의 article
+                    title_hint = (meta_title or (text if text else "(첨부 파일)"))[:300]
+                    article = {
+                        "pmid": "",
+                        "pmc_id": "",
+                        "doi": meta_doi,
+                        "title": title_hint,
+                        "abstract": extracted,
+                        "authors": meta.get("authors") or [],
+                        "affiliation": meta.get("affiliation") or "",
+                        "journal": meta.get("journal") or "",
+                        "pubdate": meta.get("pubdate") or "",
+                        "url": meta_url,
+                    }
         # 파일이 없거나 추출 실패면 텍스트 경로
         if article is None and text:
             article = resolve_input(text)
@@ -712,15 +760,45 @@ def handle_message(event, say, client):
             say("⚠️ 입력에서 논문을 식별하지 못했습니다. 제목 / PMID / PubMed URL / 초록 원문 / PDF 파일 중 하나를 보내주세요.")
             return
 
-        # 이전에 analyze_bot으로 이미 분석한 PMID면 재분석 않고 이전 쓰레드 안내
+        # 이전에 analyze_bot으로 이미 분석한 PMID인지 확인
         pmid = article.get("pmid") or ""
         if pmid:
             prev = lookup_analyzed_entry(pmid)
             if prev is not None:
-                permalink = (prev or {}).get("permalink") or ""
+                prev_permalink = (prev or {}).get("permalink") or ""
+                prev_ts = (prev or {}).get("ts") or ""
+                prev_has_pdf = bool((prev or {}).get("has_pdf"))
+                has_current_pdf = attachment_bytes is not None and attachment_ext == ".pdf"
+
+                # Case: 기존에 PDF 없었고 이번 요청에 PDF가 있으면 → 이전 쓰레드에 PDF 추가
+                if has_current_pdf and not prev_has_pdf and prev_ts:
+                    try:
+                        filename = _safe_filename(article.get("title") or "paper") + ".pdf"
+                        client.files_upload_v2(
+                            channel=CHANNEL,
+                            thread_ts=prev_ts,
+                            file=attachment_bytes,
+                            filename=filename,
+                            title=filename,
+                            initial_comment="📎 사용자 요청으로 원문 PDF를 추가 첨부했습니다.",
+                        )
+                        remember_analyzed_pmid(pmid, has_pdf=True)
+                        msg = ("⏱ 이 논문은 이전에 이미 분석되었습니다. "
+                               "원문 PDF가 없었어서 이번 요청의 PDF를 해당 쓰레드에 추가했습니다.")
+                        if prev_permalink:
+                            msg += f"\n→ 이전 분석 쓰레드: {prev_permalink}"
+                        say(msg)
+                        return
+                    except Exception as e:
+                        print(f"[dedup] 기존 쓰레드에 PDF 추가 실패: {e}",
+                              file=sys.stderr)
+                        traceback.print_exc()
+                        # 실패 시 아래 일반 안내로 폴백
+
+                # 그 외: 그냥 이전 쓰레드 링크만 안내
                 msg = "⏱ 이 논문은 이전에 이미 분석 완료되었습니다."
-                if permalink:
-                    msg += f"\n→ 이전 분석 쓰레드: {permalink}"
+                if prev_permalink:
+                    msg += f"\n→ 이전 분석 쓰레드: {prev_permalink}"
                 say(msg)
                 return
 
@@ -739,7 +817,8 @@ def handle_message(event, say, client):
         )
         # 분석 이력을 GitHub에 기록 (pubmed_agent 일일 수집 dedup + 재요청 시 링크 제공)
         if pmid:
-            remember_analyzed_pmid(pmid, thread_ts, permalink)
+            remember_analyzed_pmid(pmid, thread_ts, permalink,
+                                   has_pdf=bool(attachment_bytes))
     except Exception as e:
         traceback.print_exc()
         say(f"❌ 분석 중 오류: `{e}`")
