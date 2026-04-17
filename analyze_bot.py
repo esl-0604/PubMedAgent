@@ -24,6 +24,8 @@ import re
 import sys
 import threading
 import traceback
+from datetime import datetime, timezone
+from pathlib import Path
 
 # Windows 콘솔 CP949에서도 한글·이모지 출력되도록 UTF-8로 재구성
 try:
@@ -119,14 +121,75 @@ def _extract_text_from_bytes(data: bytes, file_info: dict) -> str:
 UNPAYWALL_EMAIL = os.environ.get("UNPAYWALL_EMAIL", "eunsang.lee@endorobo.com")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "esl-0604/PubMedAgent")
 ANALYZED_API_PATH = "state/analyzed_pmids.json"
+ANALYZED_LOCAL_PATH = Path(__file__).parent / "state" / "analyzed_pmids.json"
 _REMEMBER_LOCK = threading.Lock()
 
 
-def remember_analyzed_pmid(pmid: str) -> None:
-    """분석 완료한 PMID를 GitHub 리포의 state/analyzed_pmids.json에 append.
+def _github_get_analyzed() -> tuple[dict, str | None]:
+    """GitHub에서 analyzed_pmids.json 전체 읽어 (dict, sha) 반환.
 
-    GitHub REST API `contents`를 사용해 SHA 기반 낙관적 락으로 처리.
-    GITHUB_TOKEN 없거나 실패 시 경고만 찍고 스킵 (다음 DM 처리엔 영향 없음).
+    list 형식(하위 호환)은 {pmid: {}} 형태 dict로 승격.
+    파일 없으면 ({}, None).
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN 미설정")
+    api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{ANALYZED_API_PATH}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    r = requests.get(api, headers=headers, timeout=30)
+    if r.status_code == 404:
+        return {}, None
+    r.raise_for_status()
+    j = r.json()
+    sha = j.get("sha")
+    raw = base64.b64decode(j.get("content") or "").decode("utf-8")
+    if not raw.strip():
+        return {}, sha
+    data = json.loads(raw)
+    if isinstance(data, dict):
+        return data, sha
+    if isinstance(data, list):
+        return {p: {} for p in data}, sha
+    return {}, sha
+
+
+def lookup_analyzed_entry(pmid: str) -> dict | None:
+    """GitHub에서 PMID 분석 이력 조회. 있으면 entry dict(permalink 등), 없으면 None.
+
+    토큰 없거나 API 실패 시 로컬 파일(auto-update로 최대 2분 지연)으로 폴백.
+    """
+    if not pmid:
+        return None
+    try:
+        existing, _ = _github_get_analyzed()
+        entry = existing.get(pmid)
+        return entry if isinstance(entry, dict) else (None if entry is None else {})
+    except Exception as e:
+        print(f"[lookup] GitHub 조회 실패, 로컬 폴백: {e}", file=sys.stderr)
+        if not ANALYZED_LOCAL_PATH.exists():
+            return None
+        try:
+            data = json.loads(ANALYZED_LOCAL_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if isinstance(data, dict):
+            entry = data.get(pmid)
+            return entry if isinstance(entry, dict) else (None if entry is None else {})
+        if isinstance(data, list) and pmid in data:
+            return {}
+        return None
+
+
+def remember_analyzed_pmid(pmid: str, thread_ts: str = "",
+                           permalink: str = "") -> None:
+    """PMID를 state/analyzed_pmids.json에 추가. dict 스키마로 저장.
+
+    스키마: {pmid: {"ts": thread_ts, "permalink": permalink, "analyzed_at": ISO8601}}
+    GitHub REST API로 SHA 기반 낙관적 락. GITHUB_TOKEN 없으면 스킵.
     """
     if not pmid:
         return
@@ -144,36 +207,28 @@ def remember_analyzed_pmid(pmid: str) -> None:
             "X-GitHub-Api-Version": "2022-11-28",
         }
         for attempt in range(3):
-            # 1) 현재 파일 상태 조회
-            sha = None
-            existing: list[str] = []
             try:
-                r = requests.get(api, headers=headers, timeout=30)
+                existing, sha = _github_get_analyzed()
             except Exception as e:
                 print(f"[remember] GET 실패: {e}", file=sys.stderr)
                 return
-            if r.status_code == 200:
-                j = r.json()
-                sha = j.get("sha")
-                try:
-                    raw = base64.b64decode(j.get("content") or "").decode("utf-8")
-                    existing = json.loads(raw) if raw.strip() else []
-                except Exception:
-                    existing = []
-            elif r.status_code != 404:
-                print(f"[remember] GET HTTP {r.status_code}: {r.text[:200]}",
-                      file=sys.stderr)
+
+            # 이미 있고 permalink까지 있으면 건너뜀
+            cur = existing.get(pmid)
+            if isinstance(cur, dict) and cur.get("permalink"):
                 return
 
-            if pmid in existing:
-                return  # 이미 기록됨
+            existing[pmid] = {
+                "ts": thread_ts,
+                "permalink": permalink,
+                "analyzed_at": datetime.now(timezone.utc).isoformat(),
+            }
 
-            try:
-                merged = sorted(set(existing + [pmid]), key=int)[-5000:]
-            except ValueError:
-                merged = list(dict.fromkeys(existing + [pmid]))
+            # 5000개 초과 시 오래된 것부터 제거 (insertion order 기준)
+            if len(existing) > 5000:
+                existing = dict(list(existing.items())[-5000:])
 
-            content = json.dumps(merged, ensure_ascii=False)
+            content = json.dumps(existing, ensure_ascii=False, indent=0)
             payload = {
                 "message": f"chore: analyze_bot PMID {pmid} 추가 [skip ci]",
                 "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
@@ -191,7 +246,6 @@ def remember_analyzed_pmid(pmid: str) -> None:
                 print(f"[remember] PMID {pmid} GitHub 등록 성공", file=sys.stderr)
                 return
             if r.status_code == 409:
-                # SHA conflict — 다른 커밋이 먼저 들어옴. 재시도.
                 print(f"[remember] SHA 충돌, 재시도 {attempt+1}/3",
                       file=sys.stderr)
                 continue
@@ -487,7 +541,8 @@ def analyze_article(article: dict) -> str:
 def post_to_channel(article: dict, analysis: str, requester_id: str,
                     web_client,
                     attachment_bytes: bytes | None = None,
-                    attachment_ext: str = "") -> None:
+                    attachment_ext: str = "") -> tuple[str, str]:
+    """채널에 부모 + 쓰레드 + 원문 첨부 포스팅. (thread_ts, permalink) 반환."""
     title = article.get("title") or "제목 미상"
     url = article.get("url")
     title_link = f"<{url}|{title}>" if url else title
@@ -553,6 +608,15 @@ def post_to_channel(article: dict, analysis: str, requester_id: str,
         except Exception as e:
             print(f"[upload] 첨부 업로드 실패: {e}", file=sys.stderr)
             traceback.print_exc()
+
+    # 부모 메시지의 permalink 조회 (중복 재요청 시 링크 제공용)
+    permalink = ""
+    try:
+        pl = web_client.chat_getPermalink(channel=CHANNEL, message_ts=thread_ts)
+        permalink = pl.get("permalink", "") or ""
+    except Exception as e:
+        print(f"[permalink] 조회 실패: {e}", file=sys.stderr)
+    return thread_ts, permalink
 
 
 def _chunk(text: str, size: int) -> list[str]:
@@ -648,6 +712,18 @@ def handle_message(event, say, client):
             say("⚠️ 입력에서 논문을 식별하지 못했습니다. 제목 / PMID / PubMed URL / 초록 원문 / PDF 파일 중 하나를 보내주세요.")
             return
 
+        # 이전에 analyze_bot으로 이미 분석한 PMID면 재분석 않고 이전 쓰레드 안내
+        pmid = article.get("pmid") or ""
+        if pmid:
+            prev = lookup_analyzed_entry(pmid)
+            if prev is not None:
+                permalink = (prev or {}).get("permalink") or ""
+                msg = "⏱ 이 논문은 이전에 이미 분석 완료되었습니다."
+                if permalink:
+                    msg += f"\n→ 이전 분석 쓰레드: {permalink}"
+                say(msg)
+                return
+
         # 첨부 결정 및 상태 문구 생성.
         if attachment_bytes is not None:
             attach_note = "사용자가 업로드한 원문 PDF를 이 쓰레드에 첨부했습니다."
@@ -656,13 +732,14 @@ def handle_message(event, say, client):
 
         analysis_body = analyze_article(article)
         full_body = f"*[원문 첨부]*\n{attach_note}\n\n{analysis_body}"
-        post_to_channel(article, full_body, user_id, client,
-                        attachment_bytes=attachment_bytes,
-                        attachment_ext=attachment_ext)
-        # 분석한 PMID를 GitHub에 기록해 pubmed_agent 일일 수집과 중복 방지
-        pmid = article.get("pmid")
+        thread_ts, permalink = post_to_channel(
+            article, full_body, user_id, client,
+            attachment_bytes=attachment_bytes,
+            attachment_ext=attachment_ext,
+        )
+        # 분석 이력을 GitHub에 기록 (pubmed_agent 일일 수집 dedup + 재요청 시 링크 제공)
         if pmid:
-            remember_analyzed_pmid(pmid)
+            remember_analyzed_pmid(pmid, thread_ts, permalink)
     except Exception as e:
         traceback.print_exc()
         say(f"❌ 분석 중 오류: `{e}`")

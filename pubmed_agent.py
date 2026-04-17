@@ -70,13 +70,19 @@ def load_sent_pmids() -> set[str]:
 def load_analyzed_pmids() -> set[str]:
     """analyze_bot이 DM으로 분석해 채널에 올린 PMID 집합.
 
-    pubmed_agent이 일일 수집할 때 이 목록도 함께 제외해 중복 전송 방지.
+    파일 스키마는 dict[pmid] → {ts, permalink, analyzed_at}.
+    하위 호환을 위해 list 형식도 허용.
     """
     if not ANALYZED_PATH.exists():
         return set()
     try:
         with open(ANALYZED_PATH, "r", encoding="utf-8") as f:
-            return set(json.load(f))
+            data = json.load(f)
+        if isinstance(data, dict):
+            return set(data.keys())
+        if isinstance(data, list):
+            return set(data)
+        return set()
     except (json.JSONDecodeError, OSError):
         return set()
 
