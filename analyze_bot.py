@@ -840,6 +840,44 @@ def _chunk(text: str, size: int) -> list[str]:
     return parts
 
 
+def _fetch_interests_from_github() -> list[dict] | None:
+    """GitHub에서 paper_interests.jsonl을 직접 fetch. 실패 시 None 반환(로컬 폴백)."""
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return None
+    api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{INTERESTS_API_PATH}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        r = requests.get(api, headers=headers, timeout=15)
+    except Exception as e:
+        print(f"[profile] GitHub fetch 실패: {e}", file=sys.stderr)
+        return None
+    if r.status_code == 404:
+        return []
+    if r.status_code != 200:
+        print(f"[profile] GitHub GET HTTP {r.status_code}", file=sys.stderr)
+        return None
+    try:
+        raw = base64.b64decode(r.json().get("content") or "").decode("utf-8")
+    except Exception as e:
+        print(f"[profile] decode 실패: {e}", file=sys.stderr)
+        return None
+    records = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
+
+
 def _profile_llm_summary(records: list[dict]) -> str:
     """최근 기록을 Claude에 보내 종합 해석 요약 생성."""
     condensed = []
@@ -879,7 +917,10 @@ def handle_profile_command(ack, respond, command):
     """`/profile` — analyze_bot에 축적된 관심 논문 프로파일 집계 + Claude 요약."""
     ack()
     try:
-        records = load_records()
+        # GitHub에서 최신 기록 직접 fetch (auto-update 지연 회피)
+        records = _fetch_interests_from_github()
+        if records is None:
+            records = load_records()  # 폴백: 로컬 파일
         if not records:
             respond(text="아직 기록된 관심 논문이 없습니다.\n"
                          "analyze_bot으로 논문을 분석해야 자동으로 기록이 쌓입니다.")
