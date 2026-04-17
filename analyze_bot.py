@@ -60,6 +60,16 @@ claude = Anthropic(api_key=ANTHROPIC_API_KEY)
 PMID_RE = re.compile(r"^\s*(\d{6,9})\s*$")
 URL_RE = re.compile(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)")
 MAX_FILE_BYTES = 20 * 1024 * 1024  # 20MB 이상 파일은 거부
+INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _safe_filename(name: str, default: str = "paper") -> str:
+    """파일명으로 쓸 수 없는 문자(: / \\ | ? * 등)를 '-'로 치환."""
+    name = INVALID_FILENAME_RE.sub("-", name or "")
+    name = re.sub(r"\s+", " ", name).strip().strip(".")
+    if len(name) > 150:
+        name = name[:150].rstrip().rstrip(".")
+    return name or default
 
 
 def _download_slack_file(file_info: dict) -> bytes:
@@ -78,12 +88,11 @@ def _download_slack_file(file_info: dict) -> bytes:
     return data
 
 
-def _extract_text_from_file(file_info: dict) -> str:
-    """Slack file 객체에서 텍스트 추출. PDF/plaintext 지원."""
+def _extract_text_from_bytes(data: bytes, file_info: dict) -> str:
+    """이미 다운로드된 바이너리에서 텍스트 추출. PDF/plaintext 지원."""
     filetype = (file_info.get("filetype") or "").lower()
     mimetype = (file_info.get("mimetype") or "").lower()
     name = file_info.get("name") or "attachment"
-    data = _download_slack_file(file_info)
 
     if filetype == "pdf" or mimetype == "application/pdf" or name.lower().endswith(".pdf"):
         from pypdf import PdfReader
@@ -103,6 +112,45 @@ def _extract_text_from_file(file_info: dict) -> str:
             return ""
 
     raise ValueError(f"지원하지 않는 파일 타입: {filetype or mimetype or name}")
+
+
+def _pmc_pdf_bytes(pmc_id: str) -> bytes | None:
+    """PMC Open-Access 서비스로 PDF URL 조회 후 다운로드. OA 아니면 None."""
+    if not pmc_id:
+        return None
+    pmc_id = pmc_id.replace("PMC", "")
+    try:
+        r = requests.get(
+            "https://pmc.ncbi.nlm.nih.gov/utils/oa/oa.fcgi",
+            params={"id": f"PMC{pmc_id}"},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return None
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(r.text)
+        if root.find(".//error") is not None:
+            return None
+        pdf_link = root.find(".//link[@format='pdf']")
+        if pdf_link is None:
+            return None
+        href = pdf_link.get("href")
+        if not href:
+            return None
+        if href.startswith("ftp://"):
+            href = href.replace("ftp://", "https://", 1)
+        pdf_r = requests.get(href, timeout=60, stream=True)
+        if pdf_r.status_code != 200:
+            return None
+        data = b""
+        for chunk in pdf_r.iter_content(chunk_size=65536):
+            data += chunk
+            if len(data) > MAX_FILE_BYTES:
+                return None
+        return data
+    except Exception as e:
+        print(f"[pmc] 다운로드 실패: {e}", file=sys.stderr)
+        return None
 
 
 def _esearch_by_title(title: str) -> str | None:
@@ -151,6 +199,7 @@ def resolve_input(text: str) -> dict | None:
         # 초록/본문 텍스트로 간주
         return {
             "pmid": "",
+            "pmc_id": "",
             "title": "(DM 입력 텍스트 분석)",
             "abstract": text,
             "authors": [],
@@ -244,7 +293,9 @@ def analyze_article(article: dict) -> str:
 
 
 def post_to_channel(article: dict, analysis: str, requester_id: str,
-                    web_client) -> None:
+                    web_client,
+                    attachment_bytes: bytes | None = None,
+                    attachment_ext: str = "") -> None:
     title = article.get("title") or "제목 미상"
     url = article.get("url")
     title_link = f"<{url}|{title}>" if url else title
@@ -296,6 +347,21 @@ def post_to_channel(article: dict, analysis: str, requester_id: str,
             unfurl_links=False, unfurl_media=False,
         )
 
+    # 원문 첨부 (있을 때만). 파일명은 논문 제목 기준으로 정리.
+    if attachment_bytes:
+        filename = _safe_filename(title) + (attachment_ext or ".bin")
+        try:
+            web_client.files_upload_v2(
+                channel=CHANNEL,
+                thread_ts=thread_ts,
+                file=attachment_bytes,
+                filename=filename,
+                title=filename,
+            )
+        except Exception as e:
+            print(f"[upload] 첨부 업로드 실패: {e}", file=sys.stderr)
+            traceback.print_exc()
+
 
 def _chunk(text: str, size: int) -> list[str]:
     if len(text) <= size:
@@ -336,12 +402,27 @@ def handle_message(event, say, client):
 
     try:
         article = None
+        attachment_bytes: bytes | None = None
+        attachment_ext: str = ""
+
         # 파일이 있으면 우선 파일에서 텍스트 추출 → 초록으로 사용
         if files:
             extracted_chunks: list[str] = []
             for f in files:
                 try:
-                    extracted_chunks.append(_extract_text_from_file(f))
+                    data = _download_slack_file(f)
+                    text_part = _extract_text_from_bytes(data, f)
+                    if text_part:
+                        extracted_chunks.append(text_part)
+                    # 첫 번째 파일을 원문 첨부용으로 보관
+                    if attachment_bytes is None:
+                        attachment_bytes = data
+                        fname = f.get("name") or ""
+                        if "." in fname:
+                            attachment_ext = "." + fname.rsplit(".", 1)[1].lower()
+                        else:
+                            ft = (f.get("filetype") or "pdf").lower()
+                            attachment_ext = f".{ft}"
                 except Exception as fe:
                     say(f"⚠️ 파일 `{f.get('name')}` 처리 실패: {fe}")
             extracted = "\n\n".join(c for c in extracted_chunks if c).strip()
@@ -356,6 +437,7 @@ def handle_message(event, say, client):
                               or (text if text else "(첨부 파일)"))[:300]
                 article = {
                     "pmid": "",
+                    "pmc_id": "",
                     "title": title_hint,
                     "abstract": extracted,
                     "authors": meta.get("authors") or [],
@@ -367,12 +449,26 @@ def handle_message(event, say, client):
         # 파일이 없거나 추출 실패면 텍스트 경로
         if article is None and text:
             article = resolve_input(text)
+            # 사용자가 긴 원문 텍스트를 직접 붙여넣은 경우 → .txt로 첨부
+            if article and article.get("title") == "(DM 입력 텍스트 분석)":
+                attachment_bytes = text.encode("utf-8")
+                attachment_ext = ".txt"
 
         if not article:
             say("⚠️ 입력에서 논문을 식별하지 못했습니다. 제목 / PMID / PubMed URL / 초록 원문 / PDF 파일 중 하나를 보내주세요.")
             return
+
+        # 첨부가 아직 없고, PMC open-access ID가 있으면 PDF 다운로드 시도
+        if attachment_bytes is None and article.get("pmc_id"):
+            pdf = _pmc_pdf_bytes(article["pmc_id"])
+            if pdf:
+                attachment_bytes = pdf
+                attachment_ext = ".pdf"
+
         analysis = analyze_article(article)
-        post_to_channel(article, analysis, user_id, client)
+        post_to_channel(article, analysis, user_id, client,
+                        attachment_bytes=attachment_bytes,
+                        attachment_ext=attachment_ext)
     except Exception as e:
         traceback.print_exc()
         say(f"❌ 분석 중 오류: `{e}`")
