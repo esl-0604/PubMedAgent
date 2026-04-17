@@ -42,6 +42,7 @@ from anthropic import Anthropic
 from anthropic_logger import log_usage
 
 from pubmed_agent import EUTILS, efetch, load_config, load_dotenv
+from interest_profile import aggregate, load_records
 
 load_dotenv()
 CFG = load_config()
@@ -837,6 +838,90 @@ def _chunk(text: str, size: int) -> list[str]:
     if remaining:
         parts.append(remaining)
     return parts
+
+
+def _profile_llm_summary(records: list[dict]) -> str:
+    """최근 기록을 Claude에 보내 종합 해석 요약 생성."""
+    condensed = []
+    for r in records[-200:]:
+        condensed.append({
+            "title": r.get("title"),
+            "journal": r.get("journal"),
+            "authors": (r.get("authors") or [])[:3],
+            "affiliations": (r.get("affiliations") or [])[:2],
+            "features": r.get("features") or {},
+        })
+    system = (
+        "사용자가 주로 분석 요청한 논문들의 패턴을 한국어로 요약. "
+        "EndoRobotics(연성 내시경 수술 로봇/기구) 관점에서 해석. "
+        "섹션: *[선호 주제]*, *[선호 저널]*, *[선호 저자·기관]*, "
+        "*[선호 기술·기구]*, *[연구 유형 경향]*, *[종합 해석]*. "
+        "각 섹션 3~5줄, 구체적 예시 인용. Slack mrkdwn 사용."
+    )
+    try:
+        resp = claude.messages.create(
+            model=MODEL, max_tokens=1500, system=system,
+            messages=[{"role": "user",
+                       "content": f"총 {len(records)}건 기록. 아래는 최근 {len(condensed)}건:\n\n"
+                                  f"{json.dumps(condensed, ensure_ascii=False, indent=1)}"}],
+        )
+        log_usage(script="analyze_bot", model=MODEL,
+                  input_tokens=resp.usage.input_tokens,
+                  output_tokens=resp.usage.output_tokens,
+                  request_type="profile_summary")
+        return resp.content[0].text.strip()
+    except Exception as e:
+        return f"(요약 실패: {e})"
+
+
+@app.command("/profile")
+def handle_profile_command(ack, respond, command):
+    """`/profile` — analyze_bot에 축적된 관심 논문 프로파일 집계 + Claude 요약."""
+    ack()
+    try:
+        records = load_records()
+        if not records:
+            respond(text="아직 기록된 관심 논문이 없습니다.\n"
+                         "analyze_bot으로 논문을 분석해야 자동으로 기록이 쌓입니다.")
+            return
+
+        agg = aggregate(records)
+
+        def _top(counter, n: int = 8) -> str:
+            if not counter:
+                return "_(없음)_"
+            return "\n".join(f"• {cnt} — `{item}`"
+                             for item, cnt in counter.most_common(n))
+
+        stats_text = (
+            f"*📊 관심 프로파일 — 총 {len(records)}건 분석*\n\n"
+            f"*저널 TOP*\n{_top(agg['journals'])}\n\n"
+            f"*토픽 TOP*\n{_top(agg['topics'])}\n\n"
+            f"*기술·기구 TOP*\n{_top(agg['techniques'])}\n\n"
+            f"*저자 TOP*\n{_top(agg['authors'])}\n\n"
+            f"*기관 TOP*\n{_top(agg['affiliations'])}\n\n"
+            f"*도메인 분포*\n{_top(agg['domains'], n=5)}\n\n"
+            f"*Focus 분포*\n{_top(agg['focus'], n=5)}"
+        )
+
+        for c in _chunk(stats_text, 2800):
+            respond(blocks=[{"type": "section",
+                             "text": {"type": "mrkdwn", "text": c}}],
+                    text="관심 프로파일 집계")
+
+        # Claude 종합 해석 (기록 5건 이상일 때만)
+        if len(records) >= 5:
+            summary = _profile_llm_summary(records)
+            if summary:
+                for c in _chunk(f"*💡 종합 해석*\n{summary}", 2800):
+                    respond(blocks=[{"type": "section",
+                                     "text": {"type": "mrkdwn", "text": c}}],
+                            text="종합 해석")
+        else:
+            respond(text=f"_종합 해석은 기록 5건 이상부터 생성됩니다 (현재 {len(records)}건)._")
+    except Exception as e:
+        traceback.print_exc()
+        respond(text=f"❌ 프로파일 집계 실패: `{e}`")
 
 
 @app.event("message")
