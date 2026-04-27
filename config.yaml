@@ -21,6 +21,13 @@ keywords:
   - "polyp detection"
   - "haptic feedback"
   - "surgical teleoperation"
+  # D. 시술 확장 (Phase A)
+  - "endoscopic mucosal resection"
+  - "endoscopic ultrasound"
+  - "endoscopic resection"
+  - "underwater EMR"
+  - "cold snare polypectomy"
+  - "Barrett's esophagus"
 
 # GI(위장관) 도메인으로 결과를 국한 (쿼리 A의 AND 조건).
 domain_terms:
@@ -36,6 +43,15 @@ domain_terms:
   - "duodenal"
   - "small bowel"
   - "intestinal"
+  # 질환·증상 (Phase A)
+  - "polyp"
+  - "adenoma"
+  - "Barrett"
+  - "achalasia"
+  - "GERD"
+  - "Crohn"
+  - "ulcerative colitis"
+  - "IBD"
 
 # 쿼리 A에 적용하는 GI/내시경 주요 저널 (NLM ISO 약어).
 journals:
@@ -51,6 +67,12 @@ journals:
   - "Tech Innov Gastrointest Endosc"
   - "J Gastroenterol Hepatol"
   - "Gastric Cancer"
+  # Phase A 추가
+  - "Lancet Gastroenterol Hepatol"
+  - "Therap Adv Gastroenterol"
+  - "J Crohns Colitis"
+  - "World J Gastroenterol"
+  - "Hepatology"
 
 # 쿼리 B: Medical Physical AI — GI 국한을 벗어나도 포함.
 physical_ai_terms:
@@ -77,11 +99,14 @@ physical_ai_journals:
   - "Med Image Anal"
   - "Nat Med"
   - "Ann Surg"
+  # Phase A 추가
+  - "IEEE J Biomed Health Inform"
+  - "Comput Methods Programs Biomed"
 
 authors: []
 
-lookback_days: 2
-max_results: 10
+lookback_days: 3
+max_results: 15
 
 # Slack
 slack_channel_id: "C0AT6K46UC9"
